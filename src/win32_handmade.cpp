@@ -67,7 +67,7 @@ static void ResizeDIBSection(offscreen_buffer *buffer, int32_t width, int32_t he
   buffer->bitmapInfo.bmiHeader.biCompression = BI_RGB;
 
   int32_t bitmapMemorySize = buffer->width * buffer->height * buffer->bytesPerPixel;
-  buffer->buffer = VirtualAlloc(0, bitmapMemorySize, MEM_COMMIT, PAGE_READWRITE);
+  buffer->buffer = VirtualAlloc(0, bitmapMemorySize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
   buffer->pitch = buffer->width * buffer->bytesPerPixel;
 }
