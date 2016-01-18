@@ -4,7 +4,7 @@
 #include <math.h>
 #include <dsound.h>
 
-#define PI 3.14159265
+#define PI 3.14159265f
 
 static bool running;
 struct offscreen_buffer
@@ -17,8 +17,25 @@ struct offscreen_buffer
   int32_t pitch;
 };
 static offscreen_buffer buffer;
-static LPDIRECTSOUNDBUFFER secondaryBuffer;
-static uint32_t runningSampleIndex;
+struct sound_parameters
+{
+  int32_t samplesPerSecond;
+  int32_t numberOfChannels;
+  int32_t bytesPerSample;
+  int32_t toneHz;
+  int32_t samplesPerPeriod;
+  int32_t volume;
+  int32_t bufferSize;
+};
+
+struct sound_output
+{
+  sound_parameters *parameters;
+  LPDIRECTSOUNDBUFFER primaryBuffer;
+  LPDIRECTSOUNDBUFFER secondaryBuffer;
+  uint32_t runningSampleIndex;
+};
+static sound_output soundOutput;
 
 struct window_dimensions
 {
@@ -93,7 +110,7 @@ static void CopyBufferToWindow(offscreen_buffer *buffer, HDC deviceContext, int3
 #define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND *ppDS, LPUNKNOWN pUnkOuter);
 typedef DIRECT_SOUND_CREATE(direct_sound_create);
 
-static void InitDSound(HWND hwnd, int32_t bufferSize, int32_t samplesPerSecond)
+static void InitDSound(HWND hwnd, sound_output *output)
 {
   HMODULE directSoundLibrary = LoadLibraryA("dsound.dll");
   if (!directSoundLibrary)
@@ -126,8 +143,7 @@ static void InitDSound(HWND hwnd, int32_t bufferSize, int32_t samplesPerSecond)
   bufferDescription.dwSize = sizeof(bufferDescription);
   bufferDescription.dwFlags = DSBCAPS_PRIMARYBUFFER;
 
-  LPDIRECTSOUNDBUFFER primaryBuffer;
-  if (!SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &primaryBuffer, 0)))
+  if (!SUCCEEDED(directSound->CreateSoundBuffer(&bufferDescription, &output->primaryBuffer, 0)))
   {
     OutputDebugStringA("Failed to create primary sound buffer\n");
     return;
@@ -136,12 +152,12 @@ static void InitDSound(HWND hwnd, int32_t bufferSize, int32_t samplesPerSecond)
   WAVEFORMATEX waveFormat;
   waveFormat.wFormatTag = WAVE_FORMAT_PCM;
   waveFormat.nChannels = 2;
-  waveFormat.nSamplesPerSec = samplesPerSecond;
+  waveFormat.nSamplesPerSec = output->parameters->samplesPerSecond;
   waveFormat.wBitsPerSample = 16;
   waveFormat.nBlockAlign = (waveFormat.nChannels * waveFormat.wBitsPerSample) / 8;
   waveFormat.nAvgBytesPerSec = waveFormat.nSamplesPerSec * waveFormat.nBlockAlign;
   waveFormat.cbSize = 0;
-  if (!SUCCEEDED(primaryBuffer->SetFormat(&waveFormat)))
+  if (!SUCCEEDED(output->primaryBuffer->SetFormat(&waveFormat)))
   {
     OutputDebugStringA("Failed to set format on primary buffer\n");
     return;
@@ -150,34 +166,49 @@ static void InitDSound(HWND hwnd, int32_t bufferSize, int32_t samplesPerSecond)
   DSBUFFERDESC secondaryBufferDescription = {};
   secondaryBufferDescription.dwSize = sizeof(bufferDescription);
   secondaryBufferDescription.dwFlags = DSBCAPS_GETCURRENTPOSITION2;
-  secondaryBufferDescription.dwBufferBytes = bufferSize;
+  secondaryBufferDescription.dwBufferBytes = output->parameters->bufferSize;
   secondaryBufferDescription.lpwfxFormat = &waveFormat;
 
-  if (!SUCCEEDED(directSound->CreateSoundBuffer(&secondaryBufferDescription, &secondaryBuffer, 0)))
+  if (!SUCCEEDED(directSound->CreateSoundBuffer(&secondaryBufferDescription, &output->secondaryBuffer, 0)))
   {
     OutputDebugStringA("Failed to create secondary sound buffer\n");
     return;
   }
 }
 
-static void WriteSineWaveToBuffer(LPDIRECTSOUNDBUFFER buffer, int32_t bytesPerSample, int32_t samplesPerPeriod, int32_t volume, VOID *region, DWORD regionSize)
+static void WriteSineWaveToBuffer(sound_output *output, VOID *region, DWORD regionSize)
 {
   int16_t *regionSample = (int16_t *)region;
-  DWORD regionSampleCount = regionSize / bytesPerSample;
+  DWORD regionSampleCount = regionSize / output->parameters->bytesPerSample;
   for (int32_t sampleIndex = 0;
     sampleIndex < regionSampleCount;
     sampleIndex++)
   {
-    /* sine of ('infinitely' growing index modded into period, normalized to [0-1], converted to radians) */
-    int16_t sampleValue = int16_t(sin(((runningSampleIndex % samplesPerPeriod) / (double)samplesPerPeriod) * 2 * PI) * volume);
+    int16_t sampleValue = (int16_t)(sinf(((float)output->runningSampleIndex / (float)output->parameters->samplesPerPeriod) * 2 * PI) * output->parameters->volume);
     *regionSample++ = sampleValue;
     *regionSample++ = sampleValue;
+    output->runningSampleIndex++;
+  }
+}
 
-    //char str[100];
-    //sprintf(str, "%d\n", sampleValue);
-    //OutputDebugStringA(str);
+static void FillSoundBuffer(sound_output *output, DWORD byteIndexToLock, DWORD bytesToWrite)
+{
+  VOID *region1;
+  DWORD region1Size;
+  VOID *region2;
+  DWORD region2Size;
+  if (SUCCEEDED(output->secondaryBuffer->Lock(byteIndexToLock, bytesToWrite,
+                                      &region1, &region1Size,
+                                      &region2, &region2Size,
+                                      0)))
+  {
+    WriteSineWaveToBuffer(output, region1, region1Size);
+    WriteSineWaveToBuffer(output, region2, region2Size);
 
-    runningSampleIndex++;
+    if (!SUCCEEDED(output->secondaryBuffer->Unlock(region1, region1Size, region2, region2Size)))
+    {
+      OutputDebugStringA("Failed to unlock region(s)\n");
+    }
   }
 }
 
@@ -242,15 +273,23 @@ INT WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   ShowWindow(hwnd, nCmdShow);
 
-  int32_t samplesPerSecond = 48000;
-  int32_t numberOfChannels = 2;
-  int32_t bytesPerSample = sizeof(int16_t) * numberOfChannels;
-  int32_t toneHz = 262;
-  int32_t samplesPerPeriod = samplesPerSecond / toneHz;
-  int32_t volume = 3000;
-  int32_t bufferSize = samplesPerSecond * bytesPerSample;
-  InitDSound(hwnd, bufferSize, samplesPerSecond);
-  runningSampleIndex = 0;
+  sound_parameters soundParams = {};
+  soundParams.samplesPerSecond = 48000;
+  soundParams.numberOfChannels = 2;
+  soundParams.bytesPerSample = sizeof(int16_t) * soundParams.numberOfChannels;
+  soundParams.toneHz = 262;
+  soundParams.samplesPerPeriod = soundParams.samplesPerSecond / soundParams.toneHz;
+  soundParams.volume = 3000;
+  soundParams.bufferSize = soundParams.samplesPerSecond * soundParams.bytesPerSample;
+
+  sound_output soundOutput = {};
+  soundOutput.parameters = &soundParams;
+  InitDSound(hwnd, &soundOutput);
+  FillSoundBuffer(&soundOutput, 0, soundParams.bufferSize);
+  if (!SUCCEEDED(soundOutput.secondaryBuffer->Play(0, 0, DSBPLAY_LOOPING)))
+  {
+    OutputDebugStringA("Failed to play buffer\n");
+  }
 
   MSG msg = { };
   running = true;
@@ -273,43 +312,23 @@ INT WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     RenderWeirdGradient(&buffer, xOffset++, yOffset++);
 
     /* note: direct sound test */
-    if (!SUCCEEDED(secondaryBuffer->Play(0, 0, DSBPLAY_LOOPING)))
-    {
-      OutputDebugStringA("Failed to play buffer\n");
-    }
-
     DWORD playCursor;
     DWORD writeCursor;
-    if (SUCCEEDED(secondaryBuffer->GetCurrentPosition(&playCursor, &writeCursor)))
+    if (SUCCEEDED(soundOutput.secondaryBuffer->GetCurrentPosition(&playCursor, &writeCursor)))
     {
-      DWORD byteIndexToLock = (runningSampleIndex * bytesPerSample) % bufferSize;
+      DWORD byteIndexToLock = (soundOutput.runningSampleIndex * soundParams.bytesPerSample) % soundParams.bufferSize;
       DWORD bytesToWrite;
+      /* todo: update this to use a lower latency offset from the play cursor */
       if (byteIndexToLock > playCursor)
       {
-        bytesToWrite = (bufferSize - byteIndexToLock) + playCursor;
+        bytesToWrite = (soundParams.bufferSize - byteIndexToLock) + playCursor;
       }
       else
       {
         bytesToWrite = playCursor - byteIndexToLock;
       }
 
-      VOID *region1;
-      DWORD region1Size;
-      VOID *region2;
-      DWORD region2Size;
-      if (SUCCEEDED(secondaryBuffer->Lock(byteIndexToLock, bytesToWrite,
-                                          &region1, &region1Size,
-                                          &region2, &region2Size,
-                                          0)))
-      {
-        WriteSineWaveToBuffer(secondaryBuffer, bytesPerSample, samplesPerPeriod, volume, region1, region1Size);
-        WriteSineWaveToBuffer(secondaryBuffer, bytesPerSample, samplesPerPeriod, volume, region2, region2Size);
-
-        if (!SUCCEEDED(secondaryBuffer->Unlock(region1, region1Size, region2, region2Size)))
-        {
-          OutputDebugStringA("Failed to unlock region(s)\n");
-        }
-      }
+      FillSoundBuffer(&soundOutput, byteIndexToLock, bytesToWrite);
     }
 
     HDC deviceContext = GetDC(hwnd);
